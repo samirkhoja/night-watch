@@ -1,0 +1,46 @@
+# Go build artifacts
+/bin/
+/build/
+/dist/
+/tmp/
+/night-watch
+/cmd/night-watch/night-watch
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+coverage.out
+coverage/
+*.coverprofile
+*.prof
+*.pprof
+
+# Local Go cache/workspace files
+go.work
+go.work.sum
+.gocache/
+.cache/
+
+# Local env and secrets
+.env
+.env.local
+.env.*
+!.env.example
+
+# Night Watch local project config
+.nightwatch/settings.local.json
+.nightwatch/*.local.json
+
+# Logs and temp files
+*.log
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
