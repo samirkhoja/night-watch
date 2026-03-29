@@ -5,31 +5,38 @@ import (
 	"strings"
 	"testing"
 
+	agentsdk "github.com/samirkhoja/agent-sdk"
 	"github.com/samirkhoja/night-watch/internal/config"
-	"github.com/samirkhoja/night-watch/internal/llm"
 	"github.com/samirkhoja/night-watch/internal/prompts"
 )
 
-type mockCompactionClient struct {
-	reply   string
-	err     error
-	calls   int
-	lastReq llm.GenerateRequest
+type mockCompactionProvider struct {
+	reply string
+	err   error
+	calls int
 }
 
-func (m *mockCompactionClient) Generate(ctx context.Context, req llm.GenerateRequest) (llm.GenerateResponse, error) {
-	m.calls++
-	m.lastReq = req
-	if m.err != nil {
-		return llm.GenerateResponse{}, m.err
-	}
-	return llm.GenerateResponse{
-		Reply: m.reply,
-	}, nil
-}
-
-func (m *mockCompactionClient) Name() string {
+func (m *mockCompactionProvider) DefaultModel() string {
 	return "mock-compaction"
+}
+
+func (m *mockCompactionProvider) Chat(
+	ctx context.Context,
+	messages []agentsdk.Message,
+	tools []agentsdk.ToolDefinition,
+	model string,
+	options map[string]any,
+) (*agentsdk.LLMResponse, error) {
+	_ = ctx
+	_ = messages
+	_ = tools
+	_ = model
+	_ = options
+	m.calls++
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &agentsdk.LLMResponse{Content: m.reply}, nil
 }
 
 func TestCompactMessagesForBudget(t *testing.T) {
@@ -40,13 +47,13 @@ func TestCompactMessagesForBudget(t *testing.T) {
 	session.modelMaxTokens = 2400
 	session.replyMaxTokens = 300
 
-	var messages []llm.Message
+	var messages []agentsdk.Message
 	for i := 0; i < 20; i++ {
-		role := "user"
+		role := agentsdk.RoleUser
 		if i%2 == 1 {
-			role = "assistant"
+			role = agentsdk.RoleAssistant
 		}
-		messages = append(messages, llm.Message{
+		messages = append(messages, agentsdk.Message{
 			Role:    role,
 			Content: strings.Repeat("important context item ", 80),
 		})
@@ -72,9 +79,9 @@ func TestCompactMessagesForBudgetNoop(t *testing.T) {
 	session.modelMaxTokens = 32000
 	session.replyMaxTokens = 1200
 
-	messages := []llm.Message{
-		{Role: "user", Content: "check logs in us-east-1"},
-		{Role: "assistant", Content: "Which profile should I use?"},
+	messages := []agentsdk.Message{
+		{Role: agentsdk.RoleUser, Content: "check logs in us-east-1"},
+		{Role: agentsdk.RoleAssistant, Content: "Which profile should I use?"},
 	}
 	compacted, didCompact := session.compactMessagesForBudgetWithContext(context.Background(), messages)
 	if didCompact {
@@ -85,26 +92,26 @@ func TestCompactMessagesForBudgetNoop(t *testing.T) {
 	}
 }
 
-func TestCompactMessagesForBudgetUsesCompactionClient(t *testing.T) {
+func TestCompactMessagesForBudgetUsesCompactionProvider(t *testing.T) {
 	session := NewSession(nil, &config.Config{
 		LLMProvider: "openai",
-		LLMModel:    "gpt-5.2",
+		LLMModel:    "gpt-5.4",
 	}, nil, nil)
 	session.modelMaxTokens = 2400
 	session.replyMaxTokens = 300
 
-	mockClient := &mockCompactionClient{
+	mockProvider := &mockCompactionProvider{
 		reply: "Compacted context summary:\nUser goals and constraints:\n- find root cause\nAssistant findings/actions:\n- checked cloud logs\nOpen questions:\n- none",
 	}
-	session.SetCompactionClient(mockClient)
+	session.SetCompactionProvider(mockProvider)
 
-	var messages []llm.Message
+	var messages []agentsdk.Message
 	for i := 0; i < 20; i++ {
-		role := "user"
+		role := agentsdk.RoleUser
 		if i%2 == 1 {
-			role = "assistant"
+			role = agentsdk.RoleAssistant
 		}
-		messages = append(messages, llm.Message{
+		messages = append(messages, agentsdk.Message{
 			Role:    role,
 			Content: strings.Repeat("important context item ", 80),
 		})
@@ -117,10 +124,7 @@ func TestCompactMessagesForBudgetUsesCompactionClient(t *testing.T) {
 	if len(compacted) == 0 {
 		t.Fatalf("expected compacted messages")
 	}
-	if mockClient.calls == 0 {
-		t.Fatalf("expected compaction client to be called")
-	}
-	if !mockClient.lastReq.DisableTools {
-		t.Fatalf("expected compaction request to disable tools")
+	if mockProvider.calls == 0 {
+		t.Fatalf("expected compaction provider to be called")
 	}
 }

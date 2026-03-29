@@ -1,6 +1,6 @@
 # Night Watch
 
-Night Watch is a zero-dependency DevOps agent. It uses an LLM agent to run diagnostics, inspect cloud/log signals, and correlate issues with code changes.
+Night Watch is a DevOps agent that uses an LLM agent to run diagnostics, inspect cloud/log signals, and correlate issues with code changes.
 
 ## Experimental Disclaimer
 
@@ -165,7 +165,7 @@ Example config:
 {
   "setup_complete": true,
   "llm_provider": "openai",
-  "llm_model": "gpt-5.2",
+  "llm_model": "gpt-5.4",
   "reasoning_effort": "medium",
   "cloud_provider": "aws",
   "aws_profile": "default",

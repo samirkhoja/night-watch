@@ -44,7 +44,7 @@ func TestRuntimeContextPromptIncludesConfiguredDefaults(t *testing.T) {
 		workspaceRoot: "/tmp/night-watch-root",
 		cfg: &config.Config{
 			LLMProvider:     "openai",
-			LLMModel:        "gpt-5.2",
+			LLMModel:        "gpt-5.4",
 			ReasoningEffort: "high",
 			CloudProvider:   "aws",
 			AWSProfile:      "prod",
@@ -59,7 +59,7 @@ func TestRuntimeContextPromptIncludesConfiguredDefaults(t *testing.T) {
 	}
 
 	assertContains("llm_provider: openai")
-	assertContains("llm_model: gpt-5.2")
+	assertContains("llm_model: gpt-5.4")
 	assertContains("reasoning_effort: high")
 	assertContains("cloud_provider: aws")
 	assertContains("aws_profile: prod")

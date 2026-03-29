@@ -1,4 +1,4 @@
-package llm
+package providers
 
 func anthropicThinkingBudget(effort string) int {
 	switch effort {

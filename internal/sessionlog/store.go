@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
+	agentsdk "github.com/samirkhoja/agent-sdk"
 	"github.com/samirkhoja/night-watch/internal/config"
-	"github.com/samirkhoja/night-watch/internal/llm"
 )
 
 const sessionsDirName = "sessions"
@@ -29,8 +29,16 @@ type SessionMeta struct {
 	MessageCount int
 }
 
+type Snapshot struct {
+	SessionID string
+	Messages  []agentsdk.Message
+	State     *agentsdk.SessionState
+}
+
 type reloadPayload struct {
-	Messages []llm.Message `json:"messages"`
+	SessionID string                 `json:"session_id,omitempty"`
+	Messages  []agentsdk.Message     `json:"messages"`
+	State     *agentsdk.SessionState `json:"session_state,omitempty"`
 }
 
 func NewManager(configDir string) *Manager {
@@ -39,8 +47,16 @@ func NewManager(configDir string) *Manager {
 	}
 }
 
-func (m *Manager) Save(cfg config.Config, history []llm.Message) (SessionMeta, error) {
-	messages := normalizeMessages(history)
+func (m *Manager) Save(
+	cfg config.Config,
+	sessionID string,
+	history []agentsdk.Message,
+	state *agentsdk.SessionState,
+) (SessionMeta, error) {
+	if state == nil && len(history) > 0 {
+		state = &agentsdk.SessionState{Messages: history}
+	}
+	messages := normalizedSnapshotMessages(history, state)
 	if len(messages) == 0 {
 		return SessionMeta{}, nil
 	}
@@ -62,6 +78,7 @@ func (m *Manager) Save(cfg config.Config, history []llm.Message) (SessionMeta, e
 
 	frontMatter := map[string]string{
 		"id":             id,
+		"session_id":     strings.TrimSpace(sessionID),
 		"created_at":     now.Format(time.RFC3339),
 		"llm_provider":   strings.TrimSpace(cfg.LLMProvider),
 		"llm_model":      strings.TrimSpace(cfg.LLMModel),
@@ -70,7 +87,11 @@ func (m *Manager) Save(cfg config.Config, history []llm.Message) (SessionMeta, e
 		"preview":        sanitizeFrontMatterValue(preview),
 	}
 
-	content, err := buildMarkdown(frontMatter, messages)
+	content, err := buildMarkdown(frontMatter, Snapshot{
+		SessionID: strings.TrimSpace(sessionID),
+		Messages:  messages,
+		State:     state,
+	})
 	if err != nil {
 		return SessionMeta{}, err
 	}
@@ -139,31 +160,53 @@ func (m *Manager) List() ([]SessionMeta, error) {
 	return metas, nil
 }
 
-func (m *Manager) LoadMessages(path string) ([]llm.Message, error) {
+func (m *Manager) LoadMessages(path string) ([]agentsdk.Message, error) {
+	snapshot, err := m.LoadSnapshot(path)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Messages, nil
+}
+
+func (m *Manager) LoadSnapshot(path string) (Snapshot, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read session file: %w", err)
+		return Snapshot{}, fmt.Errorf("read session file: %w", err)
 	}
 
 	jsonBlock := extractJSONCodeBlock(string(raw))
 	if strings.TrimSpace(jsonBlock) == "" {
-		return nil, errors.New("session reload data not found")
+		return Snapshot{}, errors.New("session reload data not found")
 	}
 
 	var payload reloadPayload
 	if err := json.Unmarshal([]byte(jsonBlock), &payload); err != nil {
-		return nil, fmt.Errorf("parse session reload data: %w", err)
+		return Snapshot{}, fmt.Errorf("parse session reload data: %w", err)
 	}
 
-	messages := normalizeMessages(payload.Messages)
+	messages := normalizedSnapshotMessages(payload.Messages, payload.State)
 	if len(messages) == 0 {
-		return nil, errors.New("session reload data is empty")
+		return Snapshot{}, errors.New("session reload data is empty")
 	}
-	return messages, nil
+	state := payload.State
+	if state == nil {
+		state = &agentsdk.SessionState{
+			Messages: payload.Messages,
+		}
+	}
+	return Snapshot{
+		SessionID: strings.TrimSpace(payload.SessionID),
+		Messages:  messages,
+		State:     state,
+	}, nil
 }
 
-func buildMarkdown(frontMatter map[string]string, messages []llm.Message) (string, error) {
-	payloadData, err := json.MarshalIndent(reloadPayload{Messages: messages}, "", "  ")
+func buildMarkdown(frontMatter map[string]string, snapshot Snapshot) (string, error) {
+	payloadData, err := json.MarshalIndent(reloadPayload{
+		SessionID: strings.TrimSpace(snapshot.SessionID),
+		Messages:  snapshot.Messages,
+		State:     snapshot.State,
+	}, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal reload payload: %w", err)
 	}
@@ -171,6 +214,7 @@ func buildMarkdown(frontMatter map[string]string, messages []llm.Message) (strin
 	var builder strings.Builder
 	builder.WriteString("---\n")
 	writeFrontMatterField(&builder, "id", frontMatter["id"])
+	writeFrontMatterField(&builder, "session_id", frontMatter["session_id"])
 	writeFrontMatterField(&builder, "created_at", frontMatter["created_at"])
 	writeFrontMatterField(&builder, "llm_provider", frontMatter["llm_provider"])
 	writeFrontMatterField(&builder, "llm_model", frontMatter["llm_model"])
@@ -186,10 +230,10 @@ func buildMarkdown(frontMatter map[string]string, messages []llm.Message) (strin
 
 	builder.WriteString("## Transcript (Condensed)\n\n")
 	start := 0
-	if len(messages) > 12 {
-		start = len(messages) - 12
+	if len(snapshot.Messages) > 12 {
+		start = len(snapshot.Messages) - 12
 	}
-	for idx, msg := range messages[start:] {
+	for idx, msg := range snapshot.Messages[start:] {
 		label := "Assistant"
 		if msg.Role == "user" {
 			label = "User"
@@ -321,8 +365,8 @@ func extractJSONCodeBlock(raw string) string {
 	return strings.TrimSpace(rest[:end])
 }
 
-func normalizeMessages(messages []llm.Message) []llm.Message {
-	var normalized []llm.Message
+func normalizeMessages(messages []agentsdk.Message) []agentsdk.Message {
+	var normalized []agentsdk.Message
 	for _, msg := range messages {
 		role := strings.ToLower(strings.TrimSpace(msg.Role))
 		content := strings.TrimSpace(msg.Content)
@@ -332,7 +376,7 @@ func normalizeMessages(messages []llm.Message) []llm.Message {
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		normalized = append(normalized, llm.Message{
+		normalized = append(normalized, agentsdk.Message{
 			Role:    role,
 			Content: content,
 		})
@@ -340,7 +384,18 @@ func normalizeMessages(messages []llm.Message) []llm.Message {
 	return normalized
 }
 
-func firstUserMessage(messages []llm.Message) string {
+func normalizedSnapshotMessages(history []agentsdk.Message, state *agentsdk.SessionState) []agentsdk.Message {
+	messages := normalizeMessages(history)
+	if len(messages) > 0 {
+		return messages
+	}
+	if state == nil {
+		return nil
+	}
+	return normalizeMessages(state.Messages)
+}
+
+func firstUserMessage(messages []agentsdk.Message) string {
 	for _, msg := range messages {
 		if msg.Role == "user" {
 			return msg.Content

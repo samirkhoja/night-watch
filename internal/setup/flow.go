@@ -332,13 +332,13 @@ func apiKeyEnvName(provider string) string {
 func defaultModelForProvider(provider string) string {
 	switch provider {
 	case "openai":
-		return "gpt-5.2"
+		return "gpt-5.4"
 	case "anthropic":
-		return "claude-opus-4-5"
+		return "claude-opus-4-6"
 	case "google":
 		return "gemini-3.0-pro"
 	default:
-		return "gpt-5.2"
+		return "gpt-5.4"
 	}
 }
 

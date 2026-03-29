@@ -51,7 +51,7 @@ func DefaultConfig() Config {
 	return Config{
 		SetupComplete:   false,
 		LLMProvider:     "openai",
-		LLMModel:        "gpt-5.2",
+		LLMModel:        "gpt-5.4",
 		ReasoningEffort: "medium",
 		CloudProvider:   "aws",
 		AWSProfile:      "default",

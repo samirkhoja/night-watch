@@ -3,7 +3,6 @@ package agent
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,33 +13,34 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	agentsdk "github.com/samirkhoja/agent-sdk"
 	"github.com/samirkhoja/night-watch/internal/config"
-	"github.com/samirkhoja/night-watch/internal/llm"
 	"github.com/samirkhoja/night-watch/internal/prompts"
 	"github.com/samirkhoja/night-watch/internal/ui"
 )
 
 type Session struct {
-	client           llm.Client
-	compactionClient llm.Client
-	cfg              *config.Config
-	approval         *ApprovalManager
-	out              io.Writer
-	workspaceRoot    string
-	runbookRoot      string
-	history          []llm.Message
-	maxMemory        int
-	modelMaxTokens   int
-	replyMaxTokens   int
-	maxSteps         int
-	showUserInput    bool
-}
-
-type assistantPlan struct {
-	Reply   string        `json:"reply"`
-	Actions []agentAction `json:"actions"`
+	provider           agentsdk.Provider
+	compactionProvider agentsdk.Provider
+	cfg                *config.Config
+	approval           *ApprovalManager
+	out                io.Writer
+	workspaceRoot      string
+	runbookRoot        string
+	history            []agentsdk.Message
+	maxMemory          int
+	modelMaxTokens     int
+	replyMaxTokens     int
+	maxSteps           int
+	showUserInput      bool
+	sdkAgent           *agentsdk.Agent
+	sdkStore           agentsdk.SessionStore
+	sessionID          string
+	currentRunID       string
+	runtimeMu          sync.Mutex
 }
 
 type agentAction struct {
@@ -71,7 +71,7 @@ type subAgentResult struct {
 }
 
 func NewSession(
-	client llm.Client,
+	provider agentsdk.Provider,
 	cfg *config.Config,
 	approval *ApprovalManager,
 	out io.Writer,
@@ -89,7 +89,7 @@ func NewSession(
 		workspaceRoot = cwd
 	}
 	return &Session{
-		client:         client,
+		provider:       provider,
 		cfg:            cfg,
 		approval:       approval,
 		out:            out,
@@ -99,15 +99,42 @@ func NewSession(
 		modelMaxTokens: modelMaxTokens,
 		replyMaxTokens: replyMaxTokens,
 		showUserInput:  true,
+		sessionID:      newSessionID(),
 	}
 }
 
 func (s *Session) Reset() {
 	s.history = nil
+	if s.sdkStore != nil {
+		_ = s.sdkStore.Save(context.Background(), s.sessionID, &agentsdk.SessionState{})
+	}
 }
 
 func (s *Session) SetShowUserInput(enabled bool) {
 	s.showUserInput = enabled
+}
+
+func (s *Session) SetSessionStore(store agentsdk.SessionStore) {
+	s.sdkStore = store
+	s.invalidateSDKAgent()
+}
+
+func (s *Session) SetSessionID(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = newSessionID()
+	}
+	s.sessionID = id
+}
+
+func (s *Session) SessionID() string {
+	if s == nil {
+		return newSessionID()
+	}
+	if strings.TrimSpace(s.sessionID) == "" {
+		s.sessionID = newSessionID()
+	}
+	return s.sessionID
 }
 
 func (s *Session) SetWorkspaceRoot(root string) {
@@ -120,25 +147,35 @@ func (s *Session) SetWorkspaceRoot(root string) {
 	if strings.TrimSpace(s.runbookRoot) == "" {
 		s.runbookRoot = resolved
 	}
+	s.invalidateSDKAgent()
 }
 
 func (s *Session) SetRunbookRoot(root string) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		s.runbookRoot = s.workspaceRoot
+		s.invalidateSDKAgent()
 		return
 	}
 	s.runbookRoot = resolveWorkspaceRoot(root)
+	s.invalidateSDKAgent()
 }
 
-func (s *Session) SetCompactionClient(client llm.Client) {
-	s.compactionClient = client
+func (s *Session) SetCompactionProvider(provider agentsdk.Provider) {
+	s.compactionProvider = provider
+	s.invalidateSDKAgent()
 }
 
-func (s *Session) SetHistory(messages []llm.Message) {
+func (s *Session) SetHistory(messages []agentsdk.Message) {
 	history := normalizeHistory(messages, s.maxMemory)
-	compacted, _ := s.compactMessagesForBudget(history)
-	s.history = compacted
+	s.history = history
+	if s.sdkStore == nil {
+		s.sdkStore = agentsdk.NewMemorySessionStore()
+	}
+	state := &agentsdk.SessionState{
+		Messages: history,
+	}
+	_ = s.sdkStore.Save(context.Background(), s.sessionID, state)
 }
 
 func (s *Session) SetMaxSteps(maxSteps int) {
@@ -146,11 +183,137 @@ func (s *Session) SetMaxSteps(maxSteps int) {
 		maxSteps = 0
 	}
 	s.maxSteps = maxSteps
+	s.invalidateSDKAgent()
 }
 
-func (s *Session) History() []llm.Message {
-	out := make([]llm.Message, len(s.history))
-	copy(out, s.history)
+func (s *Session) LoadHistoryFromStore(ctx context.Context) (bool, error) {
+	if s == nil || s.sdkStore == nil {
+		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state, err := s.sdkStore.Load(ctx, s.sessionID)
+	if err != nil {
+		return false, err
+	}
+	if state == nil || len(state.Messages) == 0 {
+		return false, nil
+	}
+	s.history = sdkHistoryToMessages(state.Messages, s.maxMemory)
+	return len(s.history) > 0, nil
+}
+
+func (s *Session) RestoreState(ctx context.Context, state *agentsdk.SessionState) error {
+	if s == nil || state == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.sdkStore == nil {
+		s.sdkStore = agentsdk.NewMemorySessionStore()
+	}
+	sessionID := s.SessionID()
+	if err := s.sdkStore.Save(ctx, sessionID, state); err != nil {
+		return err
+	}
+	s.history = sdkHistoryToMessages(state.Messages, s.maxMemory)
+	return nil
+}
+
+func (s *Session) LoadState(ctx context.Context) (*agentsdk.SessionState, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.sdkStore == nil {
+		if len(s.history) == 0 {
+			return nil, nil
+		}
+		return &agentsdk.SessionState{Messages: s.history}, nil
+	}
+	state, err := s.sdkStore.Load(ctx, s.SessionID())
+	if err != nil {
+		return nil, err
+	}
+	if state == nil {
+		return nil, nil
+	}
+	if len(state.Messages) == 0 && state.ActiveRun == nil && len(state.Runs) == 0 {
+		if len(s.history) == 0 {
+			return nil, nil
+		}
+		return &agentsdk.SessionState{Messages: s.history}, nil
+	}
+	return state, nil
+}
+
+func (s *Session) ResumeActiveRun(ctx context.Context, showReply bool) (string, bool, error) {
+	if s == nil || s.sdkStore == nil {
+		return "", false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID := s.SessionID()
+	state, err := s.sdkStore.Load(ctx, sessionID)
+	if err != nil {
+		return "", false, err
+	}
+	if state == nil || state.ActiveRun == nil {
+		return "", false, nil
+	}
+	if err := s.ensureSDKAgent(); err != nil {
+		return "", false, err
+	}
+
+	ui.Status(s.out, "Resuming interrupted run from the selected session.")
+	ui.Thinking(s.out, "resuming interrupted run")
+	resp, err := s.sdkAgent.RunWithEvents(ctx, agentsdk.Request{
+		SessionID: sessionID,
+	}, &sessionEventSink{session: s, trackRun: true})
+	if err != nil {
+		if errors.Is(err, agentsdk.ErrMaxIterations) {
+			limit := s.maxSteps
+			if limit <= 0 {
+				limit = defaultSDKMaxIterations
+			}
+			ui.Warn(s.out, fmt.Sprintf("reached configured max steps (%d)", limit))
+		}
+		return "", true, err
+	}
+
+	reply := strings.TrimSpace(resp.Output)
+	if reply == "" {
+		reply = "I do not have a response yet. Please refine your request."
+	}
+	ui.Thinking(s.out, "complete")
+	if showReply {
+		ui.Assistant(s.out, reply)
+	}
+	s.history = s.History()
+	return reply, true, nil
+}
+
+func (s *Session) History() []agentsdk.Message {
+	if s.sdkStore == nil {
+		out := make([]agentsdk.Message, len(s.history))
+		copy(out, s.history)
+		return out
+	}
+	state, err := s.sdkStore.Load(context.Background(), s.sessionID)
+	if err != nil || state == nil {
+		out := make([]agentsdk.Message, len(s.history))
+		copy(out, s.history)
+		return out
+	}
+	history := sdkHistoryToMessages(state.Messages, s.maxMemory)
+	s.history = history
+	out := make([]agentsdk.Message, len(history))
+	copy(out, history)
 	return out
 }
 
@@ -161,131 +324,155 @@ func (s *Session) Ask(ctx context.Context, userInput string) (string, error) {
 	}
 	requiresOperationalTools := likelyNeedsTooling(userInput)
 	requiresCorrelationDelegation := likelyNeedsCorrelationDelegation(userInput)
-
 	if s.showUserInput {
 		ui.User(s.out, userInput)
 	}
-	conversation := append([]llm.Message{}, s.history...)
-	conversation = append(conversation, llm.Message{
-		Role:    "user",
-		Content: userInput,
-	})
-
-	loopResult, err := s.runActionLoop(ctx, actionLoopConfig{
-		SystemPrompt:        s.agentSystemPrompt(),
-		InitialConversation: conversation,
-		MaxSteps:            s.maxSteps,
-		MaxTokens:           s.replyMaxTokens,
-		EmptyReply:          "I do not have a response yet. Please refine your request.",
-		ExecuteAction:       s.executeAction,
-		Hooks: actionLoopHooks{
-			BeforeStep: func(step int, messages []llm.Message) ([]llm.Message, error) {
-				compacted, didCompact := s.compactMessagesForBudgetWithContext(ctx, messages)
-				if didCompact {
-					ui.Status(s.out, "compacting conversation to stay within model token budget")
-				}
-				return compacted, nil
-			},
-			BeforeGenerate: func(step int) {
-				ui.Thinking(s.out, fmt.Sprintf("thinking (step %d)", step))
-			},
-			OnReasoning: func(reason string) {
-				ui.Reasoning(s.out, reason)
-			},
-			BeforeFinalize: func(
-				step int,
-				reply string,
-				plan assistantPlan,
-				state *actionLoopState,
-				messages *[]llm.Message,
-				modelResp llm.GenerateResponse,
-			) (bool, string) {
-				if requiresOperationalTools &&
-					state.OperationalActions == 0 &&
-					step <= 3 &&
-					!looksLikeClarifyingQuestion(reply) {
-					ui.Thinking(s.out, "requesting concrete tool execution")
-					*messages = appendAssistantFollowUp(
-						*messages,
-						modelResp,
-						"For this request, run at least one diagnostic tool call before finalizing "+
-							"(run_command or spawn_sub_agents). "+
-							"Status-only updates are not sufficient.",
-					)
-					return true, ""
-				}
-				if requiresCorrelationDelegation &&
-					state.CommandActions == 0 &&
-					step <= 4 &&
-					!looksLikeClarifyingQuestion(reply) {
-					ui.Thinking(s.out, "requesting correlation evidence collection commands")
-					*messages = appendAssistantFollowUp(
-						*messages,
-						modelResp,
-						"For correlation requests, gather concrete evidence first with run_command "+
-							"(for example recent commits and provider/runtime error signals). "+
-							"Then continue.",
-					)
-					return true, ""
-				}
-				if requiresCorrelationDelegation &&
-					state.CommandActions > 0 &&
-					state.SubAgentActions == 0 &&
-					step <= 5 &&
-					!looksLikeClarifyingQuestion(reply) {
-					ui.Thinking(s.out, "requesting delegated correlation synthesis")
-					*messages = appendAssistantFollowUp(
-						*messages,
-						modelResp,
-						"Now delegate correlation synthesis via spawn_sub_agent (or spawn_sub_agents). "+
-							"Pass a focused goal and include evidence from gathered command outputs "+
-							"so the sub-agent can identify likely commit/deploy suspects.",
-					)
-					return true, ""
-				}
-				return false, ""
-			},
-			BeforeActions: func(step int, actions []agentAction) {
-				ui.Thinking(s.out, fmt.Sprintf("executing %d action(s)", len(actions)))
-			},
-			BeforeAction: func(step int, index int, total int, action agentAction) {
-				ui.Thinking(s.out, fmt.Sprintf("action %d/%d: %s", index+1, total, actionLabel(action)))
-			},
-		},
-	})
+	if err := s.ensureSDKAgent(); err != nil {
+		return "", err
+	}
+	ui.Thinking(s.out, "thinking")
+	reply, err := s.askWithSDKGuardrails(
+		ctx,
+		userInput,
+		requiresOperationalTools,
+		requiresCorrelationDelegation,
+	)
 	if err != nil {
 		return "", err
 	}
-
-	reply := strings.TrimSpace(loopResult.Reply)
-	if reply == "" {
-		reply = "I do not have a response yet. Please refine your request."
-	}
-	if s.maxSteps > 0 && loopResult.ReachedMaxSteps {
-		ui.Warn(s.out, fmt.Sprintf("reached configured max steps (%d)", s.maxSteps))
-	}
 	ui.Thinking(s.out, "complete")
 	ui.Assistant(s.out, reply)
-	s.appendHistory(userInput, reply)
+	s.history = s.History()
 	return reply, nil
 }
 
-func (s *Session) executeAction(ctx context.Context, action agentAction) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(action.Type)) {
-	case "status":
-		msg := strings.TrimSpace(action.Message)
-		if msg == "" {
-			msg = "working..."
+type sdkRunStats struct {
+	ActionRuns         int
+	OperationalActions int
+	CommandActions     int
+	SubAgentActions    int
+}
+
+func (s *Session) askWithSDKGuardrails(
+	ctx context.Context,
+	userInput string,
+	requiresOperationalTools bool,
+	requiresCorrelationDelegation bool,
+) (string, error) {
+	currentInput := userInput
+	reply := ""
+	cumulative := sdkRunStats{}
+
+	for attempt := 1; attempt <= 4; attempt++ {
+		resp, err := s.sdkAgent.RunWithEvents(ctx, agentsdk.Request{
+			SessionID: s.sessionID,
+			Input:     currentInput,
+		}, &sessionEventSink{session: s, trackRun: true})
+		if err != nil {
+			if errors.Is(err, agentsdk.ErrMaxIterations) {
+				limit := s.maxSteps
+				if limit <= 0 {
+					limit = defaultSDKMaxIterations
+				}
+				ui.Warn(s.out, fmt.Sprintf("reached configured max steps (%d)", limit))
+			}
+			return "", err
 		}
-		ui.Status(s.out, msg)
-		return msg, nil
-	case "run_command":
-		return s.executeCommandAction(ctx, action)
-	case "spawn_sub_agents", "spawn_sub_agent":
-		return s.executeSubAgentsAction(ctx, action)
-	default:
-		return "", fmt.Errorf("unsupported action type: %s", action.Type)
+
+		reply = strings.TrimSpace(resp.Output)
+		stats := summarizeSDKRun(resp.Messages)
+		cumulative.ActionRuns += stats.ActionRuns
+		cumulative.OperationalActions += stats.OperationalActions
+		cumulative.CommandActions += stats.CommandActions
+		cumulative.SubAgentActions += stats.SubAgentActions
+
+		followUp, status := sdkGuardrailFollowUp(
+			attempt,
+			reply,
+			cumulative,
+			requiresOperationalTools,
+			requiresCorrelationDelegation,
+		)
+		if strings.TrimSpace(followUp) == "" {
+			break
+		}
+		if status != "" {
+			ui.Thinking(s.out, status)
+		}
+		currentInput = followUp
 	}
+
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		reply = "I do not have a response yet. Please refine your request."
+	}
+	return reply, nil
+}
+
+func summarizeSDKRun(messages []agentsdk.Message) sdkRunStats {
+	stats := sdkRunStats{}
+	toolNamesByID := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Role == agentsdk.RoleAssistant {
+			for _, call := range msg.ToolCalls {
+				name := strings.ToLower(strings.TrimSpace(call.Name))
+				if name == "" && call.Function != nil {
+					name = strings.ToLower(strings.TrimSpace(call.Function.Name))
+				}
+				if name == "" || strings.TrimSpace(call.ID) == "" {
+					continue
+				}
+				toolNamesByID[call.ID] = name
+			}
+			continue
+		}
+		if msg.Role != agentsdk.RoleTool {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(toolNamesByID[msg.ToolCallID]))
+		if name == "" {
+			continue
+		}
+		stats.ActionRuns++
+		switch name {
+		case "run_command":
+			stats.OperationalActions++
+			stats.CommandActions++
+		case "spawn_sub_agent", "spawn_sub_agents":
+			stats.OperationalActions++
+			stats.SubAgentActions++
+		}
+	}
+	return stats
+}
+
+func sdkGuardrailFollowUp(
+	attempt int,
+	reply string,
+	stats sdkRunStats,
+	requiresOperationalTools bool,
+	requiresCorrelationDelegation bool,
+) (string, string) {
+	if looksLikeClarifyingQuestion(reply) {
+		return "", ""
+	}
+	if requiresOperationalTools && stats.OperationalActions == 0 && attempt <= 1 {
+		return "For this request, run at least one diagnostic tool call before finalizing " +
+				"(run_command or spawn_sub_agents). Status-only updates are not sufficient.",
+			"requesting concrete tool execution"
+	}
+	if requiresCorrelationDelegation && stats.CommandActions == 0 && attempt <= 2 {
+		return "For correlation requests, gather concrete evidence first with run_command " +
+				"(for example recent commits and provider/runtime error signals). Then continue.",
+			"requesting correlation evidence collection commands"
+	}
+	if requiresCorrelationDelegation && stats.CommandActions > 0 && stats.SubAgentActions == 0 && attempt <= 3 {
+		return "Now delegate correlation synthesis via spawn_sub_agent (or spawn_sub_agents). " +
+				"Pass a focused goal and include evidence from gathered command outputs " +
+				"so the sub-agent can identify likely commit/deploy suspects.",
+			"requesting delegated correlation synthesis"
+	}
+	return "", ""
 }
 
 func (s *Session) executeCommandAction(ctx context.Context, action agentAction) (string, error) {
@@ -338,23 +525,6 @@ func (s *Session) executeCommandAction(ctx context.Context, action agentAction) 
 		return "", err
 	}
 	return formatCommandResult(result), nil
-}
-
-func (s *Session) appendHistory(userInput, assistantReply string) {
-	s.history = append(s.history, llm.Message{
-		Role:    "user",
-		Content: userInput,
-	})
-	s.history = append(s.history, llm.Message{
-		Role:    "assistant",
-		Content: assistantReply,
-	})
-	s.history = normalizeHistory(s.history, s.maxMemory)
-	compacted, didCompact := s.compactMessagesForBudget(s.history)
-	s.history = compacted
-	if didCompact {
-		ui.Status(s.out, "compacted session history for future turns")
-	}
 }
 
 type commandResult struct {
@@ -992,87 +1162,6 @@ func isBlockedCommand(command string) bool {
 	return false
 }
 
-func planFromGenerateResponse(response llm.GenerateResponse) assistantPlan {
-	plan := assistantPlan{
-		Reply:   strings.TrimSpace(response.Reply),
-		Actions: make([]agentAction, 0, len(response.ToolCalls)),
-	}
-
-	for _, call := range response.ToolCalls {
-		actionType := strings.ToLower(strings.TrimSpace(call.Name))
-		args := cloneParams(call.Arguments)
-		action := agentAction{
-			Type: actionType,
-		}
-
-		switch actionType {
-		case "status":
-			action.Message = stringParam(args, "message")
-		case "run_command":
-			action.Reason = firstNonEmpty(
-				stringParam(args, "reason"),
-				stringParam(args, "why"),
-				stringParam(args, "rationale"),
-			)
-			action.Command = stringParam(args, "command")
-			action.Cwd = stringParam(args, "cwd")
-			action.TimeoutSec = intParam(args, "timeout_sec", 0)
-		case "spawn_sub_agents", "spawn_sub_agent":
-			action.Params = args
-		default:
-			action.Params = args
-		}
-
-		plan.Actions = append(plan.Actions, action)
-	}
-
-	return plan
-}
-
-func formatAssistantTurn(response llm.GenerateResponse) string {
-	var builder strings.Builder
-
-	reply := strings.TrimSpace(response.Reply)
-	if reply != "" {
-		builder.WriteString(reply)
-	}
-
-	if len(response.ToolCalls) > 0 {
-		if builder.Len() > 0 {
-			builder.WriteString("\n")
-		}
-		builder.WriteString("Tool calls:\n")
-		for i, call := range response.ToolCalls {
-			builder.WriteString(fmt.Sprintf("%d. %s", i+1, strings.TrimSpace(call.Name)))
-			if len(call.Arguments) > 0 {
-				args, err := json.Marshal(call.Arguments)
-				if err == nil {
-					builder.WriteString(" ")
-					builder.WriteString(string(args))
-				}
-			}
-			builder.WriteByte('\n')
-		}
-	}
-
-	formatted := strings.TrimSpace(builder.String())
-	if formatted == "" {
-		return "(no assistant output)"
-	}
-	return formatted
-}
-
-func cloneParams(params map[string]interface{}) map[string]interface{} {
-	if len(params) == 0 {
-		return nil
-	}
-	out := make(map[string]interface{}, len(params))
-	for key, value := range params {
-		out[key] = value
-	}
-	return out
-}
-
 func stringParam(params map[string]interface{}, key string) string {
 	if params == nil {
 		return ""
@@ -1116,49 +1205,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func onlyStatusActions(actions []agentAction) bool {
-	if len(actions) == 0 {
-		return true
-	}
-	for _, action := range actions {
-		if strings.ToLower(strings.TrimSpace(action.Type)) != "status" {
-			return false
-		}
-	}
-	return true
-}
-
-func actionLabel(action agentAction) string {
-	switch strings.ToLower(strings.TrimSpace(action.Type)) {
-	case "status":
-		if msg := strings.TrimSpace(action.Message); msg != "" {
-			return msg
-		}
-		return "status update"
-	case "run_command":
-		if cmd := strings.TrimSpace(action.Command); cmd != "" {
-			return summarizeInline(cmd, 56)
-		}
-		return "run command"
-	case "spawn_sub_agents", "spawn_sub_agent":
-		return "spawn sub-agents"
-	default:
-		if action.Type == "" {
-			return "action"
-		}
-		return action.Type
-	}
-}
-
-func isOperationalAction(actionType string) bool {
-	switch strings.ToLower(strings.TrimSpace(actionType)) {
-	case "run_command", "spawn_sub_agents", "spawn_sub_agent":
-		return true
-	default:
-		return false
-	}
 }
 
 func likelyNeedsTooling(input string) bool {
@@ -1234,8 +1280,12 @@ func summarizeInline(value string, maxRunes int) string {
 	return string(runes[:maxRunes-3]) + "..."
 }
 
-func normalizeHistory(messages []llm.Message, maxMemory int) []llm.Message {
-	var normalized []llm.Message
+func newSessionID() string {
+	return fmt.Sprintf("session_%d", time.Now().UTC().UnixNano())
+}
+
+func normalizeHistory(messages []agentsdk.Message, maxMemory int) []agentsdk.Message {
+	var normalized []agentsdk.Message
 	for _, msg := range messages {
 		role := strings.ToLower(strings.TrimSpace(msg.Role))
 		content := strings.TrimSpace(msg.Content)
@@ -1245,7 +1295,7 @@ func normalizeHistory(messages []llm.Message, maxMemory int) []llm.Message {
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		normalized = append(normalized, llm.Message{
+		normalized = append(normalized, agentsdk.Message{
 			Role:    role,
 			Content: content,
 		})

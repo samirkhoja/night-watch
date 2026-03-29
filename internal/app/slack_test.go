@@ -36,7 +36,7 @@ func TestNotifySlackRunCompletionSendsWebhookWhenEnabled(t *testing.T) {
 	cfg.SlackEnabled = true
 	cfg.CloudProvider = "aws"
 	cfg.LLMProvider = "openai"
-	cfg.LLMModel = "gpt-5.2"
+	cfg.LLMModel = "gpt-5.4"
 
 	application.notifySlackRunCompletion(context.Background(), cfg, "check my logs", "investigation complete")
 
@@ -84,7 +84,7 @@ func TestNotifySlackRunCompletionSkipsWhenDisabled(t *testing.T) {
 func TestSlackRunCompletionMessage(t *testing.T) {
 	cfg := config.Config{
 		LLMProvider:   "openai",
-		LLMModel:      "gpt-5.2",
+		LLMModel:      "gpt-5.4",
 		CloudProvider: "aws",
 	}
 	msg := slackRunCompletionMessage(cfg, "what errors are in my logs?", "No errors found.")

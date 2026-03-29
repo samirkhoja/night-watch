@@ -6,8 +6,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	agentsdk "github.com/samirkhoja/agent-sdk"
 	"github.com/samirkhoja/night-watch/internal/config"
-	"github.com/samirkhoja/night-watch/internal/llm"
 	"github.com/samirkhoja/night-watch/internal/prompts"
 )
 
@@ -27,11 +27,11 @@ Rules:
 - Do not invent details.
 - Keep it concise and easy to continue from.`
 
-func (s *Session) compactMessagesForBudget(messages []llm.Message) ([]llm.Message, bool) {
+func (s *Session) compactMessagesForBudget(messages []agentsdk.Message) ([]agentsdk.Message, bool) {
 	return s.compactMessagesForBudgetWithContext(context.Background(), messages)
 }
 
-func (s *Session) compactMessagesForBudgetWithContext(ctx context.Context, messages []llm.Message) ([]llm.Message, bool) {
+func (s *Session) compactMessagesForBudgetWithContext(ctx context.Context, messages []agentsdk.Message) ([]agentsdk.Message, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -73,16 +73,10 @@ func (s *Session) compactMessagesForBudgetWithContext(ctx context.Context, messa
 		recent := working[cut:]
 		summary := s.summarizeForCompactionWithModel(ctx, older, summaryTarget)
 		if strings.TrimSpace(summary) == "" {
-			// If the compaction call fails, enforce budget with deterministic truncation.
 			return truncateMessagesToBudget(working, budget), true
 		}
 
-		working = append([]llm.Message{
-			{
-				Role:    "assistant",
-				Content: summary,
-			},
-		}, recent...)
+		working = append([]agentsdk.Message{{Role: agentsdk.RoleAssistant, Content: summary}}, recent...)
 		summaryTarget = maxIntValue(256, int(float64(summaryTarget)*0.8))
 	}
 
@@ -91,10 +85,11 @@ func (s *Session) compactMessagesForBudgetWithContext(ctx context.Context, messa
 
 func (s *Session) summarizeForCompactionWithModel(
 	ctx context.Context,
-	messages []llm.Message,
+	messages []agentsdk.Message,
 	targetTokens int,
 ) string {
-	if s == nil || s.compactionClient == nil || len(messages) == 0 {
+	provider := s.runtimeCompactionProvider()
+	if s == nil || provider == nil || len(messages) == 0 {
 		return ""
 	}
 
@@ -106,18 +101,25 @@ func (s *Session) summarizeForCompactionWithModel(
 	}
 
 	prompt := buildCompactionPrompt(messages)
-	resp, err := s.compactionClient.Generate(ctx, llm.GenerateRequest{
-		System:       compactionSystemPrompt,
-		Messages:     []llm.Message{{Role: "user", Content: prompt}},
-		Temperature:  0.2,
-		MaxTokens:    targetTokens,
-		DisableTools: true,
-	})
-	if err != nil {
+	resp, err := provider.Chat(
+		ctx,
+		[]agentsdk.Message{
+			{Role: agentsdk.RoleSystem, Content: compactionSystemPrompt},
+			{Role: agentsdk.RoleUser, Content: prompt},
+		},
+		nil,
+		s.runtimeCompactionModel(),
+		map[string]any{
+			"reasoning_effort":  "low",
+			"temperature":       0.2,
+			"max_output_tokens": targetTokens,
+		},
+	)
+	if err != nil || resp == nil {
 		return ""
 	}
 
-	summary := strings.TrimSpace(resp.Reply)
+	summary := strings.TrimSpace(resp.Content)
 	if summary == "" {
 		return ""
 	}
@@ -132,7 +134,7 @@ func (s *Session) summarizeForCompactionWithModel(
 	return summarizeSnippet(summary, targetChars)
 }
 
-func buildCompactionPrompt(messages []llm.Message) string {
+func buildCompactionPrompt(messages []agentsdk.Message) string {
 	var builder strings.Builder
 	builder.WriteString("Summarize these prior turns for continued incident investigation context.\n")
 	builder.WriteString("Preserve decisions, constraints, findings, and unanswered questions.\n\n")
@@ -152,7 +154,7 @@ func buildCompactionPrompt(messages []llm.Message) string {
 	return strings.TrimSpace(builder.String())
 }
 
-func summarizeHistoryForSubAgent(messages []llm.Message, maxRunes int) string {
+func summarizeHistoryForSubAgent(messages []agentsdk.Message, maxRunes int) string {
 	if len(messages) == 0 {
 		return ""
 	}
@@ -173,7 +175,7 @@ func summarizeHistoryForSubAgent(messages []llm.Message, maxRunes int) string {
 	return summarizeSnippet(builder.String(), maxRunes)
 }
 
-func truncateMessagesToBudget(messages []llm.Message, budget int) []llm.Message {
+func truncateMessagesToBudget(messages []agentsdk.Message, budget int) []agentsdk.Message {
 	working := normalizeHistory(messages, 0)
 	if len(working) == 0 {
 		return working
@@ -216,7 +218,7 @@ func (s *Session) inputTokenBudget() int {
 	return budget
 }
 
-func estimateConversationTokens(system string, messages []llm.Message) int {
+func estimateConversationTokens(system string, messages []agentsdk.Message) int {
 	total := estimateTextTokens(system) + 24
 	for _, msg := range messages {
 		total += estimateTextTokens(msg.Content) + 8
@@ -282,24 +284,12 @@ func inferModelMaxTokens(cfg *config.Config) int {
 		if strings.HasPrefix(model, "gpt-5") {
 			return 128000
 		}
-		if strings.Contains(model, "gpt-4o") {
+		if strings.HasPrefix(model, "gpt-4.1") {
 			return 128000
 		}
-		return 64000
-	default:
-		if strings.Contains(model, "claude") || strings.Contains(model, "gemini") {
-			return 200000
-		}
-		if strings.Contains(model, "gpt-4o") || strings.HasPrefix(model, "gpt-5") {
+		if strings.HasPrefix(model, "gpt-4o") {
 			return 128000
 		}
 	}
 	return 32000
-}
-
-func maxIntValue(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

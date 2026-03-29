@@ -11,9 +11,10 @@ import (
 	"strconv"
 	"strings"
 
+	agentsdk "github.com/samirkhoja/agent-sdk"
 	"github.com/samirkhoja/night-watch/internal/agent"
 	"github.com/samirkhoja/night-watch/internal/config"
-	"github.com/samirkhoja/night-watch/internal/llm"
+	"github.com/samirkhoja/night-watch/internal/providers"
 	"github.com/samirkhoja/night-watch/internal/runbooks"
 	"github.com/samirkhoja/night-watch/internal/sessionlog"
 	"github.com/samirkhoja/night-watch/internal/setup"
@@ -31,7 +32,18 @@ type App struct {
 	cfgManager   *config.Manager
 	runbooks     *runbooks.Manager
 	sessionLogs  *sessionlog.Manager
+	sessionStore agentsdk.SessionStore
 	reader       *bufio.Reader
+}
+
+type askSession interface {
+	Ask(ctx context.Context, prompt string) (string, error)
+	SessionID() string
+	History() []agentsdk.Message
+}
+
+type statefulSession interface {
+	LoadState(ctx context.Context) (*agentsdk.SessionState, error)
 }
 
 type Options struct {
@@ -73,6 +85,10 @@ func New(in io.Reader, out io.Writer, options Options) (*App, error) {
 	runbookRoot := runbookStore.StoreDir()
 
 	sessionLogs := sessionlog.NewManager(cfgManager.ConfigDir())
+	sessionStore, err := agentsdk.NewFileSessionStore(filepath.Join(cfgManager.ConfigDir(), "sdk-sessions"))
+	if err != nil {
+		return nil, err
+	}
 	return &App{
 		in:           in,
 		out:          out,
@@ -84,6 +100,7 @@ func New(in io.Reader, out io.Writer, options Options) (*App, error) {
 		cfgManager:   cfgManager,
 		runbooks:     runbookStore,
 		sessionLogs:  sessionLogs,
+		sessionStore: sessionStore,
 		reader:       bufio.NewReader(in),
 	}, nil
 }
@@ -117,16 +134,11 @@ func (a *App) RunAsk(ctx context.Context, prompt string, continueLast bool) erro
 	session := a.newSession(client, compactClient, cfg, approval)
 	session.SetShowUserInput(false)
 	if continueLast {
-		if err := a.resumeSessionHistory(session); err != nil {
+		if err := a.resumeSessionHistory(ctx, session, false); err != nil {
 			return err
 		}
 	}
-	reply, err := session.Ask(ctx, prompt)
-	if err == nil {
-		a.notifySlackRunCompletion(ctx, cfg, prompt, reply)
-		a.persistSessionHistory(cfg, session)
-	}
-	return err
+	return a.runAskWithSession(ctx, cfg, session, prompt)
 }
 
 func (a *App) RunChat(ctx context.Context, continueLast bool) error {
@@ -155,7 +167,7 @@ func (a *App) RunChat(ctx context.Context, continueLast bool) error {
 	session := a.newSession(client, compactClient, cfg, approval)
 	session.SetShowUserInput(false)
 	if continueLast {
-		if err := a.resumeSessionHistory(session); err != nil {
+		if err := a.resumeSessionHistory(ctx, session, true); err != nil {
 			return err
 		}
 	}
@@ -314,13 +326,14 @@ func (a *App) RunRunbookRemove(ctx context.Context, id string) error {
 }
 
 func (a *App) newSession(
-	client llm.Client,
-	compactionClient llm.Client,
+	provider agentsdk.Provider,
+	compactionProvider agentsdk.Provider,
 	cfg config.Config,
 	approval *agent.ApprovalManager,
 ) *agent.Session {
-	session := agent.NewSession(client, &cfg, approval, a.out)
-	session.SetCompactionClient(compactionClient)
+	session := agent.NewSession(provider, &cfg, approval, a.out)
+	session.SetCompactionProvider(compactionProvider)
+	session.SetSessionStore(a.sessionStore)
 	session.SetWorkspaceRoot(a.workingDir)
 	session.SetRunbookRoot(a.runbookRoot)
 	session.SetMaxSteps(a.maxSteps)
@@ -329,7 +342,7 @@ func (a *App) newSession(
 
 func (a *App) loadSessionDeps(
 	ctx context.Context,
-) (config.Config, llm.Client, llm.Client, *agent.ApprovalManager, error) {
+) (config.Config, agentsdk.Provider, agentsdk.Provider, *agent.ApprovalManager, error) {
 	cfg, err := a.cfgManager.Load(ctx)
 	if err != nil {
 		return config.Config{}, nil, nil, nil, err
@@ -345,11 +358,11 @@ func (a *App) loadSessionDeps(
 		}
 	}
 
-	client, err := llm.NewClient(cfg, a.cfgManager)
+	provider, err := providers.New(cfg, a.cfgManager)
 	if err != nil {
 		return config.Config{}, nil, nil, nil, err
 	}
-	compactClient, _, _ := llm.NewCompactionClient(cfg, a.cfgManager)
+	compactionProvider, _, _ := providers.NewCompaction(cfg, a.cfgManager)
 
 	approval := agent.NewApprovalManager(
 		a.in,
@@ -357,14 +370,37 @@ func (a *App) loadSessionDeps(
 		a.out,
 		agent.ApprovalOptions{AutoApprove: a.autoApproval},
 	)
-	return cfg, client, compactClient, approval, nil
+	return cfg, provider, compactionProvider, approval, nil
 }
 
 func (a *App) persistSessionHistory(cfg config.Config, session *agent.Session) {
 	if session == nil {
 		return
 	}
-	meta, err := a.sessionLogs.Save(cfg, session.History())
+	a.persistSessionHistorySnapshot(context.Background(), cfg, session)
+}
+
+func (a *App) persistSessionHistorySnapshot(
+	ctx context.Context,
+	cfg config.Config,
+	session askSession,
+) {
+	if session == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var state *agentsdk.SessionState
+	if stateful, ok := session.(statefulSession); ok {
+		loadedState, err := stateful.LoadState(ctx)
+		if err != nil {
+			ui.Warn(a.out, "Failed to load session state for snapshot: "+err.Error())
+		} else {
+			state = loadedState
+		}
+	}
+	meta, err := a.sessionLogs.Save(cfg, session.SessionID(), session.History(), state)
 	if err != nil {
 		ui.Warn(a.out, "Failed to save session history: "+err.Error())
 		return
@@ -375,7 +411,25 @@ func (a *App) persistSessionHistory(cfg config.Config, session *agent.Session) {
 	ui.Status(a.out, "Session saved: "+filepath.Base(meta.Path))
 }
 
-func (a *App) resumeSessionHistory(session *agent.Session) error {
+func (a *App) runAskWithSession(
+	ctx context.Context,
+	cfg config.Config,
+	session askSession,
+	prompt string,
+) error {
+	if session == nil {
+		return errors.New("session is not configured")
+	}
+	reply, err := session.Ask(ctx, prompt)
+	a.persistSessionHistorySnapshot(ctx, cfg, session)
+	if err != nil {
+		return err
+	}
+	a.notifySlackRunCompletion(ctx, cfg, prompt, reply)
+	return nil
+}
+
+func (a *App) resumeSessionHistory(ctx context.Context, session *agent.Session, showResumeReply bool) error {
 	if session == nil {
 		return nil
 	}
@@ -427,11 +481,27 @@ func (a *App) resumeSessionHistory(session *agent.Session) error {
 	}
 
 	selected := metas[index-1]
-	messages, err := a.sessionLogs.LoadMessages(selected.Path)
+	snapshot, err := a.sessionLogs.LoadSnapshot(selected.Path)
 	if err != nil {
 		return err
 	}
-	session.SetHistory(messages)
-	ui.Success(a.out, fmt.Sprintf("Loaded session %s (%d messages).", selected.ID, len(messages)))
+	sessionID := strings.TrimSpace(snapshot.SessionID)
+	if sessionID == "" {
+		sessionID = selected.ID
+	}
+	session.SetSessionID(sessionID)
+	restored, err := session.LoadHistoryFromStore(ctx)
+	if err != nil {
+		return err
+	}
+	if !restored {
+		if err := session.RestoreState(ctx, snapshot.State); err != nil {
+			return err
+		}
+	}
+	if _, _, err := session.ResumeActiveRun(ctx, showResumeReply); err != nil {
+		return err
+	}
+	ui.Success(a.out, fmt.Sprintf("Loaded session %s (%d messages).", selected.ID, len(session.History())))
 	return nil
 }

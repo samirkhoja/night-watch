@@ -1,170 +1,17 @@
 package agent
 
 import (
-	"context"
 	"fmt"
-	"sort"
 	"strings"
 
-	"github.com/samirkhoja/night-watch/internal/llm"
-	"github.com/samirkhoja/night-watch/internal/ui"
+	agentsdk "github.com/samirkhoja/agent-sdk"
 )
-
-func (s *Session) executeSubAgentsAction(ctx context.Context, action agentAction) (string, error) {
-	tasks := parseSubAgentTasks(action.Params, action.Message)
-	if len(tasks) == 0 {
-		return "", fmt.Errorf("spawn_sub_agents requires params.tasks with at least one task")
-	}
-
-	maxParallel := intParam(action.Params, "max_parallel", len(tasks))
-	if maxParallel <= 0 {
-		maxParallel = 1
-	}
-	if alt := intParam(action.Params, "parallelism", 0); alt > 0 {
-		maxParallel = alt
-	}
-	if maxParallel > 4 {
-		maxParallel = 4
-	}
-	if maxParallel > len(tasks) {
-		maxParallel = len(tasks)
-	}
-
-	ui.Status(s.out, fmt.Sprintf("spawning %d sub-agent(s) (parallel=%d)", len(tasks), maxParallel))
-
-	results := make([]subAgentResult, len(tasks))
-	sem := make(chan struct{}, maxParallel)
-	doneCh := make(chan subAgentResult, len(tasks))
-
-	for i, task := range tasks {
-		i := i
-		task := task
-		go func() {
-			select {
-			case <-ctx.Done():
-				doneCh <- subAgentResult{
-					Index: i,
-					Name:  task.Name,
-					Goal:  task.Goal,
-					Err:   ctx.Err(),
-				}
-				return
-			case sem <- struct{}{}:
-			}
-			defer func() { <-sem }()
-
-			result := s.runSubAgentTask(ctx, i, task)
-			doneCh <- result
-		}()
-	}
-
-	for i := 0; i < len(tasks); i++ {
-		result := <-doneCh
-		results[result.Index] = result
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Index < results[j].Index
-	})
-
-	return formatSubAgentResults(results), nil
-}
-
-func (s *Session) runSubAgentTask(ctx context.Context, index int, task subAgentTask) subAgentResult {
-	name := strings.TrimSpace(task.Name)
-	if name == "" {
-		name = fmt.Sprintf("sub-agent-%d", index+1)
-	}
-
-	maxSteps := task.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = 4
-	}
-	if maxSteps > 6 {
-		maxSteps = 6
-	}
-
-	ui.Status(s.out, fmt.Sprintf("[%s] started", name))
-
-	prompt := buildSubAgentTaskPrompt(task, s.history)
-	conversation := []llm.Message{
-		{
-			Role:    "user",
-			Content: prompt,
-		},
-	}
-	loopResult, err := s.runActionLoop(ctx, actionLoopConfig{
-		SystemPrompt:        s.subAgentSystemPrompt(),
-		InitialConversation: conversation,
-		MaxSteps:            maxSteps,
-		MaxTokens:           maxIntValue(600, s.replyMaxTokens/2),
-		EmptyReply:          "Sub-agent completed with no additional notes.",
-		ExecuteAction: func(ctx context.Context, action agentAction) (string, error) {
-			return s.executeSubAgentAction(ctx, name, action)
-		},
-		Hooks: actionLoopHooks{
-			OnComplete: func(reply string) {
-				ui.Status(s.out, fmt.Sprintf("[%s] completed", name))
-			},
-			OnMaxSteps: func(state actionLoopState) {
-				ui.Warn(s.out, fmt.Sprintf("[%s] reached max steps", name))
-			},
-		},
-	})
-	if err != nil {
-		return subAgentResult{
-			Index: index,
-			Name:  name,
-			Goal:  task.Goal,
-			Steps: loopResult.Steps,
-			Err:   err,
-		}
-	}
-
-	lastReply := strings.TrimSpace(loopResult.Reply)
-	if loopResult.ReachedMaxSteps && lastReply == "" {
-		lastReply = "Sub-agent reached max steps before final answer."
-	}
-
-	return subAgentResult{
-		Index:      index,
-		Name:       name,
-		Goal:       task.Goal,
-		Reply:      lastReply,
-		Steps:      loopResult.Steps,
-		ActionRuns: loopResult.ActionRuns,
-	}
-}
-
-func (s *Session) executeSubAgentAction(ctx context.Context, name string, action agentAction) (string, error) {
-	actionType := strings.ToLower(strings.TrimSpace(action.Type))
-	switch actionType {
-	case "status":
-		msg := strings.TrimSpace(action.Message)
-		if msg == "" {
-			msg = "working..."
-		}
-		ui.Status(s.out, fmt.Sprintf("[%s] %s", name, msg))
-		return msg, nil
-	case "run_command":
-		return s.executeCommandAction(ctx, action)
-	case "spawn_sub_agents", "spawn_sub_agent":
-		return "", fmt.Errorf("sub-agents cannot spawn sub-agents")
-	default:
-		return "", fmt.Errorf("unsupported sub-agent action type: %s", action.Type)
-	}
-}
 
 func parseSubAgentTasks(params map[string]interface{}, fallbackMessage string) []subAgentTask {
 	var tasks []subAgentTask
 	if params == nil {
 		if msg := strings.TrimSpace(fallbackMessage); msg != "" {
-			return []subAgentTask{
-				{
-					Name:     "sub-agent-1",
-					Goal:     msg,
-					MaxSteps: 4,
-				},
-			}
+			return []subAgentTask{{Name: "sub-agent-1", Goal: msg, MaxSteps: 4}}
 		}
 		return tasks
 	}
@@ -172,10 +19,7 @@ func parseSubAgentTasks(params map[string]interface{}, fallbackMessage string) [
 	if raw, ok := params["tasks"]; ok {
 		if list, ok := raw.([]interface{}); ok {
 			for i, item := range list {
-				task := subAgentTask{
-					Name:     fmt.Sprintf("sub-agent-%d", i+1),
-					MaxSteps: 4,
-				}
+				task := subAgentTask{Name: fmt.Sprintf("sub-agent-%d", i+1), MaxSteps: 4}
 				switch typed := item.(type) {
 				case string:
 					task.Goal = strings.TrimSpace(typed)
@@ -234,7 +78,7 @@ func parseSubAgentTasks(params map[string]interface{}, fallbackMessage string) [
 	return tasks
 }
 
-func buildSubAgentTaskPrompt(task subAgentTask, history []llm.Message) string {
+func buildSubAgentTaskPrompt(task subAgentTask, history []agentsdk.Message) string {
 	var builder strings.Builder
 	builder.WriteString("Task objective:\n")
 	builder.WriteString(task.Goal)
